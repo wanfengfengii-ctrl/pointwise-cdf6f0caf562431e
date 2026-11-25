@@ -1,0 +1,13 @@
+{
+  "day": "2026-08-12",
+  "stations": ["east", "west"],
+  "batch": {
+    "id": "east-day-01",
+    "station": "east",
+    "rows": [
+      {"kg": 7, "origin": "east-meter-A/0001"},
+      {"kg": 0, "origin": "east-meter-A/0002"},
+      {"kg": null, "origin": "east-meter-A/0003"}
+    ]
+  }
+}

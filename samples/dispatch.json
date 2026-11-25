@@ -1,0 +1,13 @@
+{
+  "transfer": {
+    "id": "move-01",
+    "position": 1,
+    "before": "east",
+    "after": "west"
+  },
+  "subscriptions": {
+    "district": ["east", "west"],
+    "east-only": ["east"],
+    "district-peer": ["east", "west"]
+  }
+}
