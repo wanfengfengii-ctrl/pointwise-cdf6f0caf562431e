@@ -1,12 +1,14 @@
 import sqlite3
 
-from audit.snapshots import (BookChange, BookRow, PublishedBook, atomic, create_snapshots,
-                             load_snapshot, original_order, write_snapshot)
-from exchange.subscriptions import FrozenSubscription, create_subscriptions, store_subscription
-from lake.readings import content_id
+from audit.snapshots import (BookChange, BookRow, PublishedBook, apply_changes, atomic,
+                             create_snapshots, load_snapshot, write_snapshot)
+from exchange.checkpoint import decode_checkpoint
+from exchange.subscriptions import (FrozenSubscription, create_subscriptions, load_subscription,
+                                    store_subscription)
+from lake.readings import content_id, digest
 from receiver.evidence import VerifiedArrival
-from receiver.pending import create_pending
-from receiver.receipts import FirstReceipt, create_receipts, write_first_receipt
+from receiver.pending import clear_pending, create_pending, load_pending
+from receiver.receipts import FirstReceipt, create_receipts, load_first_receipt, write_first_receipt
 
 
 def initialize_receiver(connection: sqlite3.Connection) -> None:
@@ -27,11 +29,52 @@ def initialize_receiver(connection: sqlite3.Connection) -> None:
                 subscription_id TEXT NOT NULL REFERENCES links(subscription_id),
                 reading_key BLOB NOT NULL,
                 transfer_id TEXT NOT NULL,
-                PRIMARY KEY (subscription_id, reading_key),
-                FOREIGN KEY (subscription_id, transfer_id)
-                    REFERENCES first_receipts(subscription_id, transfer_id)
+                PRIMARY KEY (subscription_id, reading_key)
             )
         ''')
+        connection.execute('''
+            CREATE TABLE IF NOT EXISTS checkpoint_adoptions (
+                subscription_id TEXT PRIMARY KEY REFERENCES subscriptions(subscription_id),
+                piece_digest TEXT NOT NULL UNIQUE,
+                piece BLOB NOT NULL,
+                opening_id TEXT NOT NULL,
+                cutoff INTEGER NOT NULL,
+                result_id TEXT NOT NULL UNIQUE REFERENCES snapshots(result_id)
+            )
+        ''')
+        connection.execute('''
+            CREATE TABLE IF NOT EXISTS checkpoint_coverage (
+                subscription_id TEXT NOT NULL REFERENCES checkpoint_adoptions(subscription_id)
+                    ON DELETE CASCADE,
+                transfer_id TEXT NOT NULL,
+                station TEXT NOT NULL,
+                packet_id TEXT NOT NULL,
+                result_id TEXT NOT NULL REFERENCES snapshots(result_id),
+                PRIMARY KEY (subscription_id, transfer_id, station)
+            )
+        ''')
+        _migrate_progress_without_receipt_foreign_key(connection)
+
+
+def _migrate_progress_without_receipt_foreign_key(connection: sqlite3.Connection) -> None:
+    foreign_keys = connection.execute('PRAGMA foreign_key_list(link_row_progress)').fetchall()
+    if not any(row[2] == 'first_receipts' for row in foreign_keys):
+        return
+    connection.execute('ALTER TABLE link_row_progress RENAME TO legacy_link_row_progress')
+    connection.execute('''
+        CREATE TABLE link_row_progress (
+            subscription_id TEXT NOT NULL REFERENCES links(subscription_id),
+            reading_key BLOB NOT NULL,
+            transfer_id TEXT NOT NULL,
+            PRIMARY KEY (subscription_id, reading_key)
+        )
+    ''')
+    connection.execute('''
+        INSERT INTO link_row_progress (subscription_id, reading_key, transfer_id)
+        SELECT subscription_id, reading_key, transfer_id
+        FROM legacy_link_row_progress
+    ''')
+    connection.execute('DROP TABLE legacy_link_row_progress')
 
 
 def install_opening_link(connection: sqlite3.Connection, subscription: FrozenSubscription,
@@ -69,19 +112,7 @@ def current_linked_result(connection: sqlite3.Connection, subscription_id: str) 
 
 
 def _apply_changes(current: PublishedBook, changes: tuple[BookChange, ...]) -> tuple[BookRow, ...]:
-    rows = {row.reading.identity: row for row in current.rows}
-    for change in sorted(changes, key=lambda item: item.direction):
-        identity = change.reading.identity
-        row = BookRow(change.station, change.reading)
-        if change.direction == -1:
-            if rows.get(identity) != row:
-                raise ValueError('withdrawal differs from the current linked original row')
-            del rows[identity]
-        else:
-            if identity in rows:
-                raise ValueError('arrival duplicates a current linked original row')
-            rows[identity] = row
-    return tuple(sorted(rows.values(), key=original_order))
+    return apply_changes(current.rows, changes)
 
 
 def publish_linked_book(connection: sqlite3.Connection, subscription: FrozenSubscription,
@@ -129,3 +160,140 @@ def publish_linked_book(connection: sqlite3.Connection, subscription: FrozenSubs
     connection.execute('UPDATE links SET current_result_id = ? WHERE subscription_id = ?',
                        (result_id, subscription_id))
     return receipt
+
+
+def load_checkpoint_adoption(connection: sqlite3.Connection, subscription_id: str):
+    return connection.execute('''
+        SELECT piece, piece_digest, opening_id, cutoff, result_id
+        FROM checkpoint_adoptions WHERE subscription_id = ?
+    ''', (subscription_id,)).fetchone()
+
+
+def checkpoint_packet_identity(connection: sqlite3.Connection, subscription_id: str,
+                               transfer_id: str, station: str):
+    return connection.execute('''
+        SELECT packet_id FROM checkpoint_coverage
+        WHERE subscription_id = ? AND transfer_id = ? AND station = ?
+    ''', (subscription_id, transfer_id, station)).fetchone()
+
+
+def adopt_checkpoint(connection: sqlite3.Connection, subscription_id: str,
+                     encoded_piece: bytes) -> str:
+    piece = decode_checkpoint(encoded_piece)
+    if piece.subscription.subscription_id != subscription_id:
+        raise ValueError('checkpoint belongs to a different subscription id')
+    with atomic(connection):
+        subscription = load_subscription(connection, subscription_id)
+        if piece.subscription != subscription:
+            raise ValueError('checkpoint frozen subscription terms do not match the local one')
+
+        existing = connection.execute('''
+            SELECT piece, result_id FROM checkpoint_adoptions WHERE subscription_id = ?
+        ''', (subscription_id,)).fetchone()
+        if existing is not None:
+            if existing[0] == encoded_piece:
+                return existing[1]
+            raise ValueError('subscription has already adopted a different checkpoint piece')
+
+        link = connection.execute('''
+            SELECT opening_result_id, current_result_id FROM links WHERE subscription_id = ?
+        ''', (subscription_id,)).fetchone()
+        if link is None:
+            raise KeyError(f'no opening link for subscription {subscription_id}')
+        baseline_id, current_id = link
+        baseline = load_snapshot(connection, baseline_id)
+        current = load_snapshot(connection, current_id)
+        if baseline is None or current is None:
+            raise KeyError(f'published link account is missing for {subscription_id}')
+        if baseline.opening_id != piece.opening_id or current.opening_id != piece.opening_id:
+            raise ValueError('checkpoint does not bind the installed original account')
+
+        readings = {row.reading.identity: row.reading for row in piece.opening.rows}
+        rows = current.rows
+        adopted_changes: list[BookChange] = []
+        checkpoint_progress: dict[bytes, str] = {}
+        entry_transfers_by_reading: dict[bytes, set[str]] = {}
+
+        for entry in piece.entries:
+            manifest = entry.manifest
+            transfer_id = manifest.transfer_id
+            reading_key = manifest.reading_id.storage_key()
+            entry_transfers_by_reading.setdefault(reading_key, set()).add(transfer_id)
+            expected_packet_ids = dict(entry.packet_ids)
+
+            receipt = load_first_receipt(connection, subscription_id, transfer_id)
+            if receipt is not None:
+                if (receipt.issue_id != manifest.issue_id or
+                        dict(receipt.piece_ids) != expected_packet_ids):
+                    raise ValueError('checkpoint conflicts with an actual settled receipt')
+            else:
+                pending = load_pending(connection, subscription_id, transfer_id)
+                if pending is not None:
+                    if pending.manifest != manifest:
+                        raise ValueError('checkpoint conflicts with a pending delivery manifest')
+                    for station, payload in pending.packets:
+                        if digest(payload) != expected_packet_ids.get(station):
+                            raise ValueError('checkpoint conflicts with a pending station piece')
+
+                reading = readings[manifest.reading_id]
+                changes = tuple(BookChange(piece_commitment.station,
+                                          piece_commitment.direction, reading)
+                                for piece_commitment in manifest.commitments)
+                rows = apply_changes(rows, changes)
+                adopted_changes.extend(changes)
+
+            if manifest.commitments:
+                checkpoint_progress[reading_key] = transfer_id
+
+        result_id = content_id('checkpoint', [
+            current.result_id,
+            piece.checkpoint_id,
+            [(row.station, row.reading.to_wire()) for row in rows],
+            [(change.station, change.direction, change.reading.to_wire())
+             for change in adopted_changes],
+        ])
+        book = PublishedBook(
+            result_id, subscription.day, subscription.stations, 'checkpoint',
+            rows, tuple(adopted_changes), subscription_id=subscription_id,
+            opening_id=piece.opening_id,
+        )
+        write_snapshot(connection, book)
+
+        connection.execute('''
+            INSERT INTO checkpoint_adoptions
+                (subscription_id, piece_digest, piece, opening_id, cutoff, result_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (subscription_id, digest(encoded_piece), encoded_piece,
+              piece.opening_id, piece.cutoff, result_id))
+        connection.executemany('''
+            INSERT INTO checkpoint_coverage
+                (subscription_id, transfer_id, station, packet_id, result_id)
+            VALUES (?, ?, ?, ?, ?)
+        ''', ((subscription_id, entry.manifest.transfer_id, station, packet_id, result_id)
+              for entry in piece.entries
+              for station, packet_id in entry.packet_ids))
+
+        for reading_key, checkpoint_transfer_id in checkpoint_progress.items():
+            previous = connection.execute('''
+                SELECT transfer_id FROM link_row_progress
+                WHERE subscription_id = ? AND reading_key = ?
+            ''', (subscription_id, reading_key)).fetchone()
+            if previous is None:
+                connection.execute('''
+                    INSERT INTO link_row_progress (subscription_id, reading_key, transfer_id)
+                    VALUES (?, ?, ?)
+                ''', (subscription_id, reading_key, checkpoint_transfer_id))
+            elif previous[0] != checkpoint_transfer_id:
+                # An actual post-cutoff receipt is newer than this checkpoint and must win.
+                if previous[0] in entry_transfers_by_reading.get(reading_key, set()):
+                    connection.execute('''
+                        UPDATE link_row_progress SET transfer_id = ?
+                        WHERE subscription_id = ? AND reading_key = ?
+                    ''', (checkpoint_transfer_id, subscription_id, reading_key))
+
+        for entry in piece.entries:
+            clear_pending(connection, subscription_id, entry.manifest.transfer_id)
+
+        connection.execute('UPDATE links SET current_result_id = ? WHERE subscription_id = ?',
+                           (result_id, subscription_id))
+        return result_id

@@ -41,6 +41,22 @@ def original_order(row: BookRow) -> tuple:
     return identity.batch_id, identity.position, identity.origin_station
 
 
+def apply_changes(rows: tuple[BookRow, ...], changes: tuple[BookChange, ...]) -> tuple[BookRow, ...]:
+    indexed = {row.reading.identity: row for row in rows}
+    for change in sorted(changes, key=lambda item: item.direction):
+        identity = change.reading.identity
+        row = BookRow(change.station, change.reading)
+        if change.direction == -1:
+            if indexed.get(identity) != row:
+                raise ValueError('withdrawal differs from the current linked original row')
+            del indexed[identity]
+        else:
+            if identity in indexed:
+                raise ValueError('arrival duplicates a current linked original row')
+            indexed[identity] = row
+    return tuple(sorted(indexed.values(), key=original_order))
+
+
 @dataclass(frozen=True)
 class PublishedBook:
     result_id: str
@@ -83,12 +99,7 @@ def write_snapshot(connection: sqlite3.Connection, book: PublishedBook) -> None:
                        (book.result_id, canonical_json(book.body())))
 
 
-def load_snapshot(connection: sqlite3.Connection, result_id: str) -> PublishedBook | None:
-    row = connection.execute('SELECT body FROM snapshots WHERE result_id = ?',
-                             (result_id,)).fetchone()
-    if row is None:
-        return None
-    body = json.loads(row[0])
+def published_book_from_body(result_id: str, body) -> PublishedBook:
     return PublishedBook(
         result_id, body['day'], tuple(body['stations']), body['kind'],
         tuple(BookRow(station, Reading.from_wire(value)) for station, value in body['rows']),
@@ -97,3 +108,11 @@ def load_snapshot(connection: sqlite3.Connection, result_id: str) -> PublishedBo
         subscription_id=body['subscription_id'], opening_id=body['opening_id'],
         transfer_id=body['transfer_id'], receipt_id=body['receipt_id'],
     )
+
+
+def load_snapshot(connection: sqlite3.Connection, result_id: str) -> PublishedBook | None:
+    row = connection.execute('SELECT body FROM snapshots WHERE result_id = ?',
+                             (result_id,)).fetchone()
+    if row is None:
+        return None
+    return published_book_from_body(result_id, json.loads(row[0]))

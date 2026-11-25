@@ -4,12 +4,13 @@ from audit.snapshots import atomic
 from exchange.subscriptions import load_subscription
 from receiver.evidence import verify_arrival
 from receiver.pending import PendingDelivery, clear_pending, record_pending_piece
-from receiver.posting import current_linked_result, publish_linked_book
+from receiver.posting import (checkpoint_packet_identity, current_linked_result,
+                              load_checkpoint_adoption, publish_linked_book)
 from receiver.receipts import FirstReceipt, load_first_receipt
 
 
 def receive_packet(connection: sqlite3.Connection, subscription_id: str,
-                   encoded: bytes) -> PendingDelivery | FirstReceipt:
+                   encoded: bytes) -> PendingDelivery | FirstReceipt | tuple[str, str]:
     with atomic(connection):
         subscription = load_subscription(connection, subscription_id)
         arrival = verify_arrival(subscription, encoded)
@@ -21,6 +22,18 @@ def receive_packet(connection: sqlite3.Connection, subscription_id: str,
                     dict(receipt.piece_ids).get(packet.station) != arrival.packet_id):
                 raise ValueError('station packet differs from the settled issue')
             return receipt
+
+        adoption = load_checkpoint_adoption(connection, subscription_id)
+        if adoption is not None:
+            covered = checkpoint_packet_identity(
+                connection, subscription_id, transfer_id, packet.station)
+            if covered is not None:
+                if covered[0] != arrival.packet_id:
+                    raise ValueError('station packet differs from checkpoint coverage')
+                return ('covered', adoption[4])
+            if packet.manifest.source_commit <= adoption[3]:
+                raise ValueError('late station piece has no exact checkpoint coverage')
+
         current_linked_result(connection, subscription_id)
         pending = record_pending_piece(connection, arrival)
         if pending.missing_stations():
